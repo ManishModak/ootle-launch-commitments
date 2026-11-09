@@ -36,7 +36,7 @@ struct Env {
 /// from a fixed key (so the build is cached across runs), and creates the fee account and a
 /// creator holding enough TARI for the fee.
 fn setup() -> Env {
-    let fee_key = RistrettoSecretKey::from_uniform_bytes(&[7u8; 64]).unwrap();
+    let fee_key = secret(200);
     let fee_public: RistrettoPublicKeyBytes = RistrettoPublicKey::from_secret_key(&fee_key).to_byte_type();
     let fee_account = derive_component_address_from_public_key(&TemplateAddress::from_array([0; 32]), &fee_public);
 
@@ -72,9 +72,15 @@ fn setup() -> Env {
     Env { test, lockbox, launcher, probe, fee_account, creator }
 }
 
+/// A fixed test key. The harness derives its own accounts' keys from small seeds the same way,
+/// so these use seeds of 100 and up.
+fn secret(seed: u8) -> RistrettoSecretKey {
+    assert!(seed >= 100, "seeds below 100 collide with the harness's accounts");
+    RistrettoSecretKey::from_uniform_bytes(&[seed; 64]).unwrap()
+}
+
 fn key(seed: u8) -> RistrettoPublicKeyBytes {
-    let secret = RistrettoSecretKey::from_uniform_bytes(&[seed; 64]).unwrap();
-    RistrettoPublicKey::from_secret_key(&secret).to_byte_type()
+    RistrettoPublicKey::from_secret_key(&secret(seed)).to_byte_type()
 }
 
 /// The launch inputs other than the fee; `Inputs::default()` is a valid launch.
@@ -118,7 +124,7 @@ fn launch_tx(env: &Env, fee: Amount, locks: Vec<(Amount, u64, RistrettoPublicKey
 }
 
 fn two_locks() -> Vec<(Amount, u64, RistrettoPublicKeyBytes)> {
-    vec![(Amount::new(TEAM), 100, key(1)), (Amount::new(ADVISORS), 200, key(2))]
+    vec![(Amount::new(TEAM), 100, key(101)), (Amount::new(ADVISORS), 200, key(102))]
 }
 
 fn balance(env: &mut Env, account: ComponentAddress, resource: ResourceAddress) -> Amount {
@@ -184,7 +190,7 @@ fn a_failure_after_the_fee_undoes_everything() {
     let creator_before = balance(&mut env, creator, TARI_TOKEN);
 
     // Lock 2's epoch is in the past: rejected after the fee was already deposited.
-    let bad = vec![(Amount::new(TEAM), 100, key(1)), (Amount::new(ADVISORS), NOW, key(2))];
+    let bad = vec![(Amount::new(TEAM), 100, key(101)), (Amount::new(ADVISORS), NOW, key(102))];
     let reason = env.test.execute_expect_failure(launch_tx(&env, LAUNCH_FEE, bad, true), vec![env.creator.1.clone()]);
     assert!(format!("{reason:?}").contains("must be after the current epoch"), "{reason:?}");
 
@@ -318,7 +324,7 @@ fn nobody_can_change_a_launched_token_but_its_owned_twin_can_be() {
 #[test]
 fn launch_rejects_bad_inputs() {
     let mut env = setup();
-    let lock = |amount: u128, epoch: u64| (Amount::new(amount), epoch, key(1));
+    let lock = |amount: u128, epoch: u64| (Amount::new(amount), epoch, key(101));
     let cases: Vec<(Inputs, &str)> = vec![
         (Inputs { locks: vec![], ..Default::default() }, "Give 1-8 locks"),
         (Inputs { locks: vec![lock(1, 100); 9], ..Default::default() }, "Give 1-8 locks"),
@@ -339,7 +345,7 @@ fn launch_rejects_bad_inputs() {
     }
 
     // Eight locks summing exactly to the supply is the largest valid launch; nothing remains.
-    let eight = vec![(Amount::new(SUPPLY / 8), 100, key(1)); 8];
+    let eight = vec![(Amount::new(SUPPLY / 8), 100, key(101)); 8];
     env.test.execute_expect_success(launch_tx_with(&env, LAUNCH_FEE, Inputs { locks: eight, ..Default::default() }, true), vec![env.creator.1.clone()]);
 }
 
@@ -359,4 +365,30 @@ fn the_fee_must_be_tari() {
         .build_and_seal(&env.creator.2);
     let reason = env.test.execute_expect_failure(tx, vec![env.creator.1.clone()]);
     assert!(format!("{reason:?}").contains("must be paid in TARI"), "{reason:?}");
+}
+
+#[test]
+fn a_beneficiary_claims_a_launch_lock_at_its_epoch() {
+    let mut env = setup();
+    let result = env.test.execute_expect_success(launch_tx(&env, LAUNCH_FEE, two_locks(), true), vec![env.creator.1.clone()]);
+    let team_lock = events(&result, env.lockbox, "LockCreated")[0];
+    let lock: ComponentAddress = team_lock.get_str("lock").unwrap().parse().unwrap();
+    let resource: ResourceAddress = team_lock.get_str("resource").unwrap().parse().unwrap();
+
+    let owner = NonFungibleAddress::from_public_key(key(101));
+    let account = env.test.create_account(key(101), None, vec![owner.clone()]);
+    let claim = |test: &TemplateTest| {
+        test.transaction()
+            .call_method(lock, "claim", args![])
+            .put_last_instruction_output_on_workspace("t")
+            .call_method(account, "deposit", args![Workspace("t")])
+            .build_and_seal(&secret(101))
+    };
+
+    let reason = env.test.execute_expect_failure(claim(&env.test), vec![owner.clone()]);
+    assert!(format!("{reason:?}").contains("Locked until epoch 100"), "{reason:?}");
+
+    env.test.set_virtual_substate(VirtualSubstateId::CurrentEpoch, VirtualSubstate::CurrentEpoch(100));
+    env.test.execute_expect_success(claim(&env.test), vec![owner]);
+    assert_eq!(balance(&mut env, account, resource), Amount::new(TEAM));
 }
