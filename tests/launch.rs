@@ -27,6 +27,7 @@ struct Env {
     test: TemplateTest,
     lockbox: TemplateAddress,
     launcher: TemplateAddress,
+    probe: TemplateAddress,
     fee_account: ComponentAddress,
     creator: Account,
 }
@@ -46,6 +47,7 @@ fn setup() -> Env {
         ("LOCKBOX_TEMPLATE", lockbox.to_string()),
         ("FEE_ACCOUNT", fee_account.to_string()),
     ]);
+    let probe = builder.add_template("tests/templates/probe");
     let mut test = TemplateTest::from_package(builder.build());
     test.bootstrap_state();
     test.set_virtual_substate(VirtualSubstateId::CurrentEpoch, VirtualSubstate::CurrentEpoch(NOW));
@@ -67,7 +69,7 @@ fn setup() -> Env {
             vec![donor.1.clone()],
         );
     }
-    Env { test, lockbox, launcher, fee_account, creator }
+    Env { test, lockbox, launcher, probe, fee_account, creator }
 }
 
 fn key(seed: u8) -> RistrettoPublicKeyBytes {
@@ -181,4 +183,114 @@ fn the_fee_must_be_exact() {
         let reason = env.test.execute_expect_failure(launch_tx(&env, fee, two_locks(), true), vec![env.creator.1.clone()]);
         assert!(format!("{reason:?}").contains("The fee is exactly"), "{reason:?}");
     }
+}
+
+/// Runs and commits a transaction signed by the creator, the signer of both tokens' creation
+/// transactions. Err holds the rejection.
+fn as_creator(env: &mut Env, build: impl FnOnce(&Env) -> Transaction) -> Result<ExecuteResult, String> {
+    let tx = build(env);
+    let proofs = vec![env.creator.1.clone()];
+    let result = env.test.execute_and_commit_on_success(tx, proofs);
+    match result.finalize.result.any_reject() {
+        None => Ok(result),
+        Some(reason) => Err(reason.to_string()),
+    }
+}
+
+/// Launches a token and parks 1,000 of it in a probe component; returns (resource, probe component).
+fn launched_token(env: &mut Env) -> (ResourceAddress, ComponentAddress) {
+    let result = env.test.execute_expect_success(launch_tx(env, LAUNCH_FEE, two_locks(), true), vec![env.creator.1.clone()]);
+    let resource: ResourceAddress = events(&result, env.launcher, "LaunchCreated")[0].get_str("resource").unwrap().parse().unwrap();
+    let (creator, probe) = (env.creator.0, env.probe);
+    as_creator(env, |env| {
+        env.test
+            .transaction()
+            .call_method(creator, "withdraw", args![resource, Amount::new(1_000)])
+            .put_last_instruction_output_on_workspace("t")
+            .call_function(probe, "hold", args![Workspace("t")])
+            .build_and_seal(&env.creator.2)
+    })
+    .unwrap();
+    (resource, env.test.expect_return::<ComponentAddress>(2))
+}
+
+/// An owned twin with the same rules, created by the same signer: (resource, probe component).
+fn owned_twin(env: &mut Env) -> (ResourceAddress, ComponentAddress) {
+    let probe = env.probe;
+    as_creator(env, |env| env.test.transaction().call_function(probe, "twin", args![Amount::new(SUPPLY)]).build_and_seal(&env.creator.2))
+        .unwrap();
+    let holder: ComponentAddress = env.test.expect_return(0);
+    let resource: ResourceAddress = env.test.call_method(holder, "resource_address", args![], vec![]);
+    (resource, holder)
+}
+
+/// Tries each privileged action on `resource` (held in `holder`); returns the outcome per action.
+fn try_privileged_actions(env: &mut Env, resource: ResourceAddress, holder: ComponentAddress) -> Vec<(&'static str, Result<(), String>)> {
+    let (creator, probe) = (env.creator.0, env.probe);
+    let mut outcomes = vec![];
+    let mut attempt = |env: &mut Env, name: &'static str, build: &dyn Fn(&Env) -> Transaction| {
+        outcomes.push((name, as_creator(env, |env| build(env)).map(|_| ())));
+    };
+    attempt(env, "mint", &|env| {
+        env.test
+            .transaction()
+            .call_function(probe, "mint", args![resource, Amount::new(1)])
+            .put_last_instruction_output_on_workspace("m")
+            .call_method(creator, "deposit", args![Workspace("m")])
+            .build_and_seal(&env.creator.2)
+    });
+    attempt(env, "burn", &|env| {
+        env.test
+            .transaction()
+            .call_method(holder, "take", args![Amount::new(1)])
+            .put_last_instruction_output_on_workspace("b")
+            .call_function(probe, "burn", args![Workspace("b")])
+            .build_and_seal(&env.creator.2)
+    });
+    attempt(env, "metadata", &|env| env.test.transaction().call_function(probe, "set_metadata", args![resource]).build_and_seal(&env.creator.2));
+    attempt(env, "rule update", &|env| env.test.transaction().call_function(probe, "open_minting", args![resource]).build_and_seal(&env.creator.2));
+    attempt(env, "hook", &|env| env.test.transaction().call_method(holder, "install_hook", args![resource]).build_and_seal(&env.creator.2));
+    attempt(env, "freeze", &|env| env.test.transaction().call_method(holder, "freeze", args![]).build_and_seal(&env.creator.2));
+    attempt(env, "recall", &|env| {
+        env.test
+            .transaction()
+            .call_method(holder, "recall", args![])
+            .put_last_instruction_output_on_workspace("r")
+            .call_method(creator, "deposit", args![Workspace("r")])
+            .build_and_seal(&env.creator.2)
+    });
+    outcomes
+}
+
+#[test]
+fn nobody_can_change_a_launched_token_but_its_owned_twin_can_be() {
+    let mut env = setup();
+    let (twin, twin_holder) = owned_twin(&mut env);
+    let twin_outcomes = try_privileged_actions(&mut env, twin, twin_holder);
+    // Positive control: the owner bypass is real, so these work on the owned twin.
+    for (name, outcome) in &twin_outcomes {
+        if ["mint", "metadata", "freeze"].contains(name) {
+            assert!(outcome.is_ok(), "the twin's owner should be able to {name}: {outcome:?}");
+        }
+    }
+
+    let (token, holder) = launched_token(&mut env);
+    for (name, outcome) in try_privileged_actions(&mut env, token, holder) {
+        let reason = outcome.expect_err(&format!("nobody may {name} a launched token, its creator included"));
+        assert!(reason.contains("AccessDenied"), "{name} must be refused by an access rule: {reason}");
+    }
+
+    // Ordinary transfers still work.
+    let other = env.test.create_empty_account();
+    let creator = env.creator.0;
+    as_creator(&mut env, |env| {
+        env.test
+            .transaction()
+            .call_method(creator, "withdraw", args![token, Amount::new(5)])
+            .put_last_instruction_output_on_workspace("t")
+            .call_method(other.0, "deposit", args![Workspace("t")])
+            .build_and_seal(&env.creator.2)
+    })
+    .unwrap();
+    assert_eq!(balance(&mut env, other.0, token), Amount::new(5));
 }
