@@ -6,10 +6,11 @@ license = "MIT"
 publish = false
 
 [dependencies]
+# Key file, indexer session and the dry-run-then-submit runner, shared with lockbox-cli.
+lockbox-cli = { path = "../../ootle-lockbox/cli" }
 ootle-rs = "0.32"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 anyhow = "1"
-rand = "0.10"
 tari_crypto = "0.24"
 tari_ootle_transaction = "0.50"
 tari_ootle_common_types = "0.50"

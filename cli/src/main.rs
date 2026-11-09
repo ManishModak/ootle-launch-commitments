@@ -1,100 +1,74 @@
 //! launch-cli: publishes the Launch Commitments template and launches a token from a local key.
 //!
-//! Usage: `launch-cli <esmeralda|mainnet> <command> [args] [--submit]`
+//! Usage: `launch-cli <esmeralda|mainnet> <command> <args> [--image <https url>] [--submit]`
 //!   address                       print the Ootle address, account and public key
 //!   status                        current epoch and account balances
 //!   publish <wasm>                publish the template
-//!   launch <template> <fee_microtari> <symbol> <name> <supply> <lock>... [--image <https url>]
+//!   launch <template> <fee_microtari> <symbol> <name> <supply> <lock>...
 //!                                 launch a token; `supply` and lock amounts are whole tokens
 //!                                 (18 decimals), each lock is `AMOUNT@UNLOCK_EPOCH[@BENEFICIARY_KEY]`
 //!                                 (the beneficiary defaults to this key)
 //!
-//! Every transaction is dry-run first; `--submit` then sends that same transaction. It reserves
-//! at most `MAX_FEE` for network fees and refuses a dry run that needs more. The launch and the
-//! remainder deposit run in the main instructions, so any failure undoes the whole launch.
-//! The key is Lockbox's: `~/.config/secrets/ootle-lockbox-<network>.key` (create it with
-//! `lockbox-cli <network> init`); it is never printed.
+//! Options go after a command's fixed arguments, so a symbol or name may be any text.
+//! Every transaction is dry-run first; `--submit` then sends that same transaction. The launch and
+//! the remainder deposit run in the main instructions, so any failure undoes the whole launch.
+//! The key file and transaction runner come from lockbox-cli (create the key with
+//! `lockbox-cli <network> init`); the key is never printed.
 
-use std::{fs, os::unix::fs::PermissionsExt, path::PathBuf, str::FromStr, time::Duration};
+use std::str::FromStr;
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use lockbox_cli::{Session, key_path, load_key, parse_network};
 use ootle_rs::{
-    Network,
     ToAccountAddress,
-    TransactionRequest,
-    builtin_templates::{
-        UnsignedTransactionBuilder,
-        component::{ComponentInvokeBuilder, IComponent, TransactionBuildable},
-    },
-    default_indexer_url,
-    key_provider::PrivateKeyProvider,
-    keys::OotleSecretKey,
-    provider::{IndexerProvider, ProviderBuilder, WalletProvider},
-    template_types::{Amount, ComponentAddress, constants::TARI_TOKEN, crypto::RistrettoPublicKeyBytes},
-    wallet::OotleWallet,
+    builtin_templates::component::TransactionBuildable,
+    template_types::{Amount, constants::TARI_TOKEN, crypto::RistrettoPublicKeyBytes},
 };
 use tari_crypto::{
-    ristretto::{RistrettoPublicKey, RistrettoSecretKey},
+    ristretto::RistrettoPublicKey,
     tari_utilities::{ByteArray, hex::Hex},
 };
 use tari_ootle_common_types::engine_types::published_template::PublishedTemplateAddress;
-use tari_ootle_transaction::{Epoch, args};
+use tari_ootle_transaction::args;
 
-/// Most a transaction may reserve, and so spend, on network fees: 5 TARI, in µT.
-const MAX_FEE: u64 = 5_000_000;
-/// How many epochs ahead a transaction may still be sequenced.
-const EPOCH_WINDOW: u64 = 10;
 /// Launched tokens have 18 decimals.
 const TOKEN_UNIT: u128 = 10u128.pow(18);
+const USAGE: &str = "usage: launch-cli <esmeralda|mainnet> <address|status|publish|launch> <args> [--image <url>] [--submit]";
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let submit = take_flag(&mut args, "--submit");
-    let image_url = take_option(&mut args, "--image")?.unwrap_or_default();
-    let [network, command, rest @ ..] = args.as_slice() else {
-        bail!("usage: launch-cli <esmeralda|mainnet> <address|status|publish|launch> [args] [--submit]");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let [network, command, rest @ ..] = args.as_slice() else { bail!(USAGE) };
+    let network = parse_network(network)?;
+    let fixed = match command.as_str() {
+        "address" | "status" => 0,
+        "publish" => 1,
+        "launch" => 5,
+        _ => bail!("unknown command {command}\n{USAGE}"),
     };
-    let network = match network.as_str() {
-        "esmeralda" => Network::Esmeralda,
-        "mainnet" => Network::MainNet,
-        other => bail!("unknown network {other}"),
-    };
+    ensure!(rest.len() >= fixed, "{command} needs {fixed} arguments\n{USAGE}");
+    let (fixed, tail) = rest.split_at(fixed);
+    let Options { submit, image_url, rest } = Options::parse(tail)?;
+    ensure!(image_url.is_none() || command == "launch", "--image only applies to launch");
+
     let secret = load_key(&key_path(network)?, network)?;
     let address = secret.to_address();
     let account = address.to_account_address();
     let public_key = *address.account_public_key();
 
     if command == "address" {
+        ensure!(rest.is_empty(), "address takes no arguments");
         println!("address:    {address}");
         println!("account:    {account}");
         println!("public key: {public_key}");
         return Ok(());
     }
 
-    let provider = ProviderBuilder::new()
-        .wallet(OotleWallet::from(PrivateKeyProvider::new(secret)))
-        .connect_with_transaction_timeout(default_indexer_url(network), Duration::from_secs(180))
-        .await
-        .context("connect to indexer")?;
-    let epoch = provider.get_epoch().await?.as_u64();
-    let max_epoch = Epoch(epoch + EPOCH_WINDOW);
-    match (command.as_str(), rest) {
-        ("status", []) => {
-            println!("epoch: {epoch}");
-            for (resource, balance) in provider.get_account_balances(account).await? {
-                println!("{resource}: {balance}");
-            }
-        },
-        ("publish", [wasm]) => {
-            let binary = fs::read(wasm).with_context(|| format!("read {wasm}"))?;
-            println!("template size: {} bytes", binary.len());
-            run(provider, account, max_epoch, Amount::zero(), submit, |b| {
-                b.then(|t| t.publish_template(binary.clone()))
-            })
-            .await?;
-        },
-        ("launch", [template, fee, symbol, name, supply, locks @ ..]) if !locks.is_empty() => {
+    let session = Session::connect(secret, network).await?;
+    match (command.as_str(), fixed, rest.as_slice()) {
+        ("status", [], []) => session.print_status(account).await?,
+        ("publish", [wasm], []) => session.publish(account, wasm, submit).await?,
+        ("launch", [template, fee, symbol, name, supply], locks) if !locks.is_empty() => {
             let template = PublishedTemplateAddress::from_str(template)
                 .map_err(|e| anyhow!("bad template address: {e:?}"))?
                 .as_template_address();
@@ -103,21 +77,48 @@ async fn main() -> Result<()> {
             let own_key = key_bytes(&public_key.to_string())?;
             let locks = locks
                 .iter()
-                .map(|spec| parse_lock(spec, own_key, epoch))
+                .map(|spec| parse_lock(spec, own_key, session.epoch))
                 .collect::<Result<Vec<_>>>()?;
-            let (symbol, name) = (symbol.clone(), name.clone());
-            run(provider, account, max_epoch, fee, submit, |b| {
-                b.call_method(account, "withdraw", args![TARI_TOKEN, fee])
-                    .put_last_instruction_output_on_workspace("fee")
-                    .call_function(template, "launch", args![Workspace("fee"), symbol, name, image_url, supply, locks])
-                    .put_last_instruction_output_on_workspace("rest")
-                    .call_method(account, "deposit", args![Workspace("rest")])
-            })
-            .await?;
+            let (symbol, name, image_url) = (symbol.clone(), name.clone(), image_url.unwrap_or_default());
+            session
+                .run(account, fee, submit, |b| {
+                    b.call_method(account, "withdraw", args![TARI_TOKEN, fee])
+                        .put_last_instruction_output_on_workspace("fee")
+                        .call_function(template, "launch", args![Workspace("fee"), symbol, name, image_url, supply, locks])
+                        .put_last_instruction_output_on_workspace("rest")
+                        .call_method(account, "deposit", args![Workspace("rest")])
+                })
+                .await?;
         },
-        _ => bail!("unknown command or wrong arguments: {command} {rest:?}"),
+        _ => bail!("wrong arguments for {command}: {rest:?}\n{USAGE}"),
     }
     Ok(())
+}
+
+/// What follows a command's fixed arguments: `--submit`, `--image <url>`, and the rest (locks).
+struct Options {
+    submit: bool,
+    image_url: Option<String>,
+    rest: Vec<String>,
+}
+
+impl Options {
+    fn parse(tail: &[String]) -> Result<Self> {
+        let mut options = Options { submit: false, image_url: None, rest: Vec::new() };
+        let mut tail = tail.iter();
+        while let Some(arg) = tail.next() {
+            match arg.as_str() {
+                "--submit" => options.submit = true,
+                "--image" => {
+                    let url = tail.next().ok_or_else(|| anyhow!("--image needs a value"))?;
+                    ensure!(options.image_url.replace(url.clone()).is_none(), "--image given twice");
+                },
+                other if other.starts_with("--") => bail!("unknown option {other}"),
+                _ => options.rest.push(arg.clone()),
+            }
+        }
+        Ok(options)
+    }
 }
 
 /// `AMOUNT@UNLOCK_EPOCH[@BENEFICIARY_KEY]`, amount in whole tokens; the key defaults to `own_key`.
@@ -145,98 +146,4 @@ fn key_bytes(hex: &str) -> Result<RistrettoPublicKeyBytes> {
     let bytes = key.as_bytes();
     ensure!(bytes.iter().any(|b| *b != 0), "{hex} is the identity point, which nobody can sign for");
     RistrettoPublicKeyBytes::try_from(bytes).map_err(|_| anyhow!("{hex} is not a 32-byte key"))
-}
-
-type Provider = IndexerProvider<OotleWallet>;
-type Builder<'p> = ComponentInvokeBuilder<'p, Provider>;
-
-/// Builds `instructions` with this account paying the fee, dry-runs it, prints the network fee,
-/// and with `submit` sends exactly that transaction. `spend` is the TARI the instructions
-/// themselves withdraw, kept out of the fee reservation. Fails unless the transaction commits.
-async fn run<F>(mut provider: Provider, account: ComponentAddress, max_epoch: Epoch, spend: Amount, submit: bool, instructions: F) -> Result<()>
-where
-    F: FnOnce(Builder<'_>) -> Builder<'_>,
-{
-    let tari = provider.get_account_balance(account, TARI_TOKEN).await?;
-    let available = tari
-        .checked_sub(spend)
-        .filter(Amount::is_positive)
-        .ok_or_else(|| anyhow!("the account holds {tari} µT, not enough for {spend} µT plus fees"))?;
-    let reserve = available.to_u64_checked().map_or(MAX_FEE, |a| a.min(MAX_FEE));
-    // A fresh nonce keeps two identical commands from producing the same transaction id.
-    let nonce: u64 = rand::random();
-    let tx = instructions(IComponent::new(&provider, max_epoch).pay_fee(reserve).then(|t| t.with_nonce(nonce)))
-        .prepare()
-        .await?;
-
-    let dry = provider.sign_and_send_dry_run(tx.clone()).await?;
-    if let Some(reason) = dry.finalize.any_reject() {
-        bail!("dry run rejected: {reason}");
-    }
-    // Dry runs are not rejected for an insufficient fee, so check the reservation covers it.
-    let fee = dry.finalize.required_fees();
-    ensure!(fee <= reserve, "the transaction needs {fee} µT in fees but only {reserve} µT is reserved");
-    println!("dry run ok; network fee {fee} µT ({:.6} TARI) of {reserve} µT reserved", fee as f64 / 1e6);
-    if !submit {
-        println!("not sent (add --submit to send)");
-        return Ok(());
-    }
-
-    let signed = TransactionRequest::default().with_transaction(tx).build(provider.wallet()).await?;
-    let pending = provider.send_transaction(signed).await?;
-    println!("sent {}", pending.tx_id());
-    let outcome = pending.watch().await?;
-    ensure!(outcome.is_commit(), "transaction {} did not commit: {outcome:?}", pending.tx_id());
-    let receipt = pending.get_receipt().await?;
-    println!("committed in epoch {}, fee paid {} µT", receipt.epoch, receipt.fee_receipt.total_fees_paid());
-    for up in &receipt.diff_summary.upped {
-        println!("upped: {}", up.substate_id);
-    }
-    for event in &receipt.events {
-        println!("event: {} {{{}}}", event.topic(), event.payload());
-    }
-    Ok(())
-}
-
-fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
-    let before = args.len();
-    args.retain(|a| a != flag);
-    args.len() != before
-}
-
-/// Removes `name <value>` from `args` and returns the value.
-fn take_option(args: &mut Vec<String>, name: &str) -> Result<Option<String>> {
-    let Some(i) = args.iter().position(|a| a == name) else { return Ok(None) };
-    ensure!(i + 1 < args.len(), "{name} needs a value");
-    let value = args.remove(i + 1);
-    args.remove(i);
-    Ok(Some(value))
-}
-
-fn network_name(network: Network) -> &'static str {
-    match network {
-        Network::MainNet => "mainnet",
-        _ => "esmeralda",
-    }
-}
-
-fn key_path(network: Network) -> Result<PathBuf> {
-    let home = std::env::var("HOME").context("HOME not set")?;
-    Ok(PathBuf::from(home).join(format!(".config/secrets/ootle-lockbox-{}.key", network_name(network))))
-}
-
-/// Loads Lockbox's key file, refusing one other users can read or made for another network.
-fn load_key(file: &PathBuf, network: Network) -> Result<OotleSecretKey> {
-    let mode = fs::metadata(file)
-        .with_context(|| format!("read {} (create it with lockbox-cli init)", file.display()))?
-        .permissions()
-        .mode();
-    ensure!(mode & 0o077 == 0, "{} must be mode 600", file.display());
-    let text = fs::read_to_string(file)?;
-    let [file_network, account, view] = <[&str; 3]>::try_from(text.lines().map(str::trim).collect::<Vec<_>>())
-        .map_err(|_| anyhow!("key file must have three lines"))?;
-    ensure!(file_network == network_name(network), "{} holds a {file_network} key, not {}", file.display(), network_name(network));
-    let parse = |hex: &str| RistrettoSecretKey::from_hex(hex).map_err(|_| anyhow!("malformed key file"));
-    let (account, view) = (parse(account)?, parse(view)?);
-    Ok(OotleSecretKey::new(network, account, view))
 }

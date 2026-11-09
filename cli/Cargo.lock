@@ -1493,8 +1493,8 @@ name = "launch-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "lockbox-cli",
  "ootle-rs",
- "rand 0.10.3",
  "tari_crypto",
  "tari_ootle_common_types",
  "tari_ootle_transaction",
@@ -1541,6 +1541,19 @@ name = "litemap"
 version = "0.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
+
+[[package]]
+name = "lockbox-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "ootle-rs",
+ "rand 0.10.3",
+ "tari_crypto",
+ "tari_ootle_common_types",
+ "tari_ootle_transaction",
+ "tokio",
+]
 
 [[package]]
 name = "log"
