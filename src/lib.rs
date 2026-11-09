@@ -9,14 +9,19 @@
 //!    points to, and emits `LaunchCreated`;
 //! 5. returns the rest of the supply for the caller to deposit in the same transaction.
 //!
-//! Any failure rolls the whole launch back, fee included.
+//! Any failure rolls the whole launch back, fee included, as long as the launch and the remainder
+//! deposit run in the transaction's main instructions (the web app and CLI always do). Calls placed
+//! in fee instructions follow the engine's fee rules instead: if a later main instruction fails,
+//! the fee-phase work, launch included, is kept.
 //!
 //! Two addresses are fixed at build time, so nobody can deploy a fee-free or Lockbox-free copy
 //! under this template's address:
 //! - `LOCKBOX_TEMPLATE`: the Lockbox template address (64 hex);
 //! - `FEE_ACCOUNT`: the account that receives fees (`component_<64 hex>`).
 //!
-//! Build with both set, e.g. `LOCKBOX_TEMPLATE=… FEE_ACCOUNT=… cargo build --release --target wasm32-unknown-unknown`.
+//! Build with both set, e.g. `LOCKBOX_TEMPLATE=… FEE_ACCOUNT=… cargo build --release --target wasm32-unknown-unknown`;
+//! `build.rs` refuses a WASM build without them. Before publishing, dry-run a launch with the exact
+//! release WASM against the target network: a well-formed but wrong address still builds.
 
 use tari_template_lib::prelude::*;
 
@@ -169,8 +174,13 @@ fn check_inputs(
     assert!(supply.is_positive(), "Supply must be positive");
     assert!((1..=MAX_LOCKS).contains(&locks.len()), "Give 1-{MAX_LOCKS} locks");
     let mut locked = Amount::zero();
-    for (amount, unlock_epoch, _) in locks {
+    for (amount, unlock_epoch, beneficiary) in locks {
         assert!(amount.is_positive(), "Each lock needs a positive amount");
+        // Nobody can sign for a non-canonical or identity key, so its lock could never be claimed.
+        assert!(
+            tari_template_lib::intrinsics::ristretto_is_canonical(beneficiary) && !beneficiary.is_zero(),
+            "Beneficiary {beneficiary} is not a valid public key"
+        );
         assert!(*unlock_epoch > now, "Unlock epoch {unlock_epoch} must be after the current epoch {now}");
         assert!(*unlock_epoch - now <= MAX_LOCK_EPOCHS, "Unlock epoch {unlock_epoch} is more than {MAX_LOCK_EPOCHS} epochs away");
         locked = locked.checked_add(*amount).expect("Lock amounts overflow");

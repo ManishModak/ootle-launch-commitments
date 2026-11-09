@@ -1,0 +1,13 @@
+[package]
+name = "failing_lockbox"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+tari_template_lib = "0.38"
+
+[lib]
+crate-type = ["cdylib"]
+
+[workspace]

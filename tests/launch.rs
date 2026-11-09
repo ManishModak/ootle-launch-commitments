@@ -36,13 +36,18 @@ struct Env {
 /// from a fixed key (so the build is cached across runs), and creates the fee account and a
 /// creator holding enough TARI for the fee.
 fn setup() -> Env {
+    setup_with_lockbox("../ootle-lockbox")
+}
+
+/// `setup`, with Launch Commitments pinned to the Lockbox-compatible template at `lockbox_path`.
+fn setup_with_lockbox(lockbox_path: &str) -> Env {
     let fee_key = secret(200);
     let fee_public: RistrettoPublicKeyBytes = RistrettoPublicKey::from_secret_key(&fee_key).to_byte_type();
     let fee_account = derive_component_address_from_public_key(&TemplateAddress::from_array([0; 32]), &fee_public);
 
     let mut builder = Package::builder();
     builder.add_all_builtin_templates();
-    let lockbox = builder.add_template("../ootle-lockbox");
+    let lockbox = builder.add_template(lockbox_path);
     let launcher = builder.add_template_opts(".", &[], [
         ("LOCKBOX_TEMPLATE", lockbox.to_string()),
         ("FEE_ACCOUNT", fee_account.to_string()),
@@ -182,6 +187,21 @@ fn one_transaction_creates_token_locks_and_record() {
     assert_eq!(info_locks, expected);
 }
 
+/// Runs `tx` expecting a rejection, commits whatever the engine kept (as a validator would), and
+/// returns the rejection reason.
+fn reject_and_commit(env: &mut Env, tx: Transaction) -> String {
+    let proofs = vec![env.creator.1.clone()];
+    let result = env.test.execute_and_commit_on_success(tx, proofs);
+    result.finalize.result.any_reject().expect("the transaction should have been rejected").to_string()
+}
+
+/// Asserts that no fee was kept, the creator kept their TARI, and no launch survived.
+fn assert_nothing_kept(env: &mut Env, fee_before: Amount, creator_before: Amount, result_reason: &str) {
+    let (fee_account, creator) = (env.fee_account, env.creator.0);
+    assert_eq!(balance(env, fee_account, TARI_TOKEN), fee_before, "no fee may be kept ({result_reason})");
+    assert_eq!(balance(env, creator, TARI_TOKEN), creator_before, "the creator keeps their TARI ({result_reason})");
+}
+
 #[test]
 fn a_failure_after_the_fee_undoes_everything() {
     let mut env = setup();
@@ -189,17 +209,35 @@ fn a_failure_after_the_fee_undoes_everything() {
     let fee_before = balance(&mut env, fee_account, TARI_TOKEN);
     let creator_before = balance(&mut env, creator, TARI_TOKEN);
 
-    // Lock 2's epoch is in the past: rejected after the fee was already deposited.
+    // Lock 2's epoch is in the past: rejected by input checks, after the fee was deposited.
     let bad = vec![(Amount::new(TEAM), 100, key(101)), (Amount::new(ADVISORS), NOW, key(102))];
-    let reason = env.test.execute_expect_failure(launch_tx(&env, LAUNCH_FEE, bad, true), vec![env.creator.1.clone()]);
-    assert!(format!("{reason:?}").contains("must be after the current epoch"), "{reason:?}");
+    let tx = launch_tx(&env, LAUNCH_FEE, bad, true);
+    let reason = reject_and_commit(&mut env, tx);
+    assert!(reason.contains("must be after the current epoch"), "{reason}");
+    assert_nothing_kept(&mut env, fee_before, creator_before, &reason);
 
-    // The remainder left undeposited: the transaction fails after every lock was made.
-    let reason = env.test.execute_expect_failure(launch_tx(&env, LAUNCH_FEE, two_locks(), false), vec![env.creator.1.clone()]);
-    let _ = reason;
+    // The remainder left undeposited: the transaction fails after every lock and the record exist.
+    let tx = launch_tx(&env, LAUNCH_FEE, two_locks(), false);
+    let reason = reject_and_commit(&mut env, tx);
+    assert_nothing_kept(&mut env, fee_before, creator_before, &reason);
+}
 
-    assert_eq!(balance(&mut env, fee_account, TARI_TOKEN), fee_before, "no fee may be kept");
-    assert_eq!(balance(&mut env, creator, TARI_TOKEN), creator_before, "the creator keeps their TARI");
+#[test]
+fn a_failure_inside_the_second_nested_lock_undoes_everything() {
+    let mut env = setup_with_lockbox("tests/templates/failing_lockbox");
+    let (fee_account, creator) = (env.fee_account, env.creator.0);
+    let fee_before = balance(&mut env, fee_account, TARI_TOKEN);
+    let creator_before = balance(&mut env, creator, TARI_TOKEN);
+
+    // Lock 1 succeeds inside the stand-in; lock 2 (epoch 666) panics inside it.
+    let locks = vec![(Amount::new(TEAM), 100, key(101)), (Amount::new(ADVISORS), 666, key(102))];
+    let tx = launch_tx(&env, LAUNCH_FEE, locks, true);
+    let reason = reject_and_commit(&mut env, tx);
+    assert!(reason.contains("Injected failure inside the nested lock"), "{reason}");
+    assert_nothing_kept(&mut env, fee_before, creator_before, &reason);
+
+    // The same template launches normally when no lock fails, so the failure above was the cause.
+    env.test.execute_expect_success(launch_tx(&env, LAUNCH_FEE, two_locks(), true), vec![env.creator.1.clone()]);
 }
 
 #[test]
@@ -330,6 +368,8 @@ fn launch_rejects_bad_inputs() {
         (Inputs { locks: vec![lock(1, 100); 9], ..Default::default() }, "Give 1-8 locks"),
         (Inputs { locks: vec![lock(SUPPLY, 100), lock(1, 100)], ..Default::default() }, "more than the supply"),
         (Inputs { locks: vec![lock(0, 100)], ..Default::default() }, "positive amount"),
+        (Inputs { locks: vec![(Amount::new(1), 100, RistrettoPublicKeyBytes::try_from(&[0u8; 32][..]).unwrap())], ..Default::default() }, "not a valid public key"),
+        (Inputs { locks: vec![(Amount::new(1), 100, RistrettoPublicKeyBytes::try_from(&[0xffu8; 32][..]).unwrap())], ..Default::default() }, "not a valid public key"),
         (Inputs { locks: vec![lock(1, NOW + 530_001)], ..Default::default() }, "epochs away"),
         (Inputs { supply: Amount::zero(), ..Default::default() }, "Supply must be positive"),
         (Inputs { symbol: "".into(), ..Default::default() }, "Symbol must be"),
@@ -339,9 +379,14 @@ fn launch_rejects_bad_inputs() {
         (Inputs { image_url: "http://example.com/x.png".into(), ..Default::default() }, "must start with https://"),
         (Inputs { image_url: "javascript:alert(1)".into(), ..Default::default() }, "must start with https://"),
     ];
+    let (fee_account, creator) = (env.fee_account, env.creator.0);
+    let fee_before = balance(&mut env, fee_account, TARI_TOKEN);
+    let creator_before = balance(&mut env, creator, TARI_TOKEN);
     for (inputs, expected) in cases {
-        let reason = env.test.execute_expect_failure(launch_tx_with(&env, LAUNCH_FEE, inputs, true), vec![env.creator.1.clone()]);
-        assert!(format!("{reason:?}").contains(expected), "expected {expected:?}, got {reason:?}");
+        let tx = launch_tx_with(&env, LAUNCH_FEE, inputs, true);
+        let reason = reject_and_commit(&mut env, tx);
+        assert!(reason.contains(expected), "expected {expected:?}, got {reason}");
+        assert_nothing_kept(&mut env, fee_before, creator_before, &reason);
     }
 
     // Eight locks summing exactly to the supply is the largest valid launch; nothing remains.
