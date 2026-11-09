@@ -1,7 +1,7 @@
 //! Launch Commitments: a token factory on Tari Ootle that charges a flat fee per launch.
 //!
 //! `LaunchRecord::launch` does everything in one transaction:
-//! 1. takes exactly `LAUNCH_FEE` native TARI and deposits it into the fee account;
+//! 1. takes exactly the launch fee in native TARI and deposits it into the fee account;
 //! 2. creates a fixed-supply public token that **nobody can ever change**: no owner, every rule
 //!    and updater locked, only withdraw and deposit open, no transfer hook;
 //! 3. locks the creator's chosen allocations in Lockbox (a separate, ownerless template);
@@ -14,19 +14,19 @@
 //! in fee instructions follow the engine's fee rules instead: if a later main instruction fails,
 //! the fee-phase work, launch included, is kept.
 //!
-//! Two addresses are fixed at build time, so nobody can deploy a fee-free or Lockbox-free copy
-//! under this template's address:
+//! Three values are fixed at build time, so a published template's fee and destinations can't
+//! change and proofs can trust its address:
 //! - `LOCKBOX_TEMPLATE`: the Lockbox template address (64 hex);
-//! - `FEE_ACCOUNT`: the account that receives fees (`component_<64 hex>`).
+//! - `FEE_ACCOUNT`: the account that receives fees (`component_<64 hex>`);
+//! - `LAUNCH_FEE_MICROTARI`: the flat fee in atomic TARI (2500000000 = 2,500 TARI on mainnet; testnet
+//!   builds use a small fee because the faucet hands out 100 TARI at a time).
 //!
-//! Build with both set, e.g. `LOCKBOX_TEMPLATE=… FEE_ACCOUNT=… cargo build --release --target wasm32-unknown-unknown`;
+//! Build with all three set, e.g. `LOCKBOX_TEMPLATE=… FEE_ACCOUNT=… LAUNCH_FEE_MICROTARI=… cargo build --release --target wasm32-unknown-unknown`;
 //! `build.rs` refuses a WASM build without them. Before publishing, dry-run a launch with the exact
 //! release WASM against the target network: a well-formed but wrong address still builds.
 
 use tari_template_lib::prelude::*;
 
-/// Flat fee per launch: 2,500 TARI (native TARI has 6 decimals).
-pub const LAUNCH_FEE: Amount = Amount::new(2_500 * 1_000_000);
 /// Every launched token has 18 decimals; amounts are in atomic units.
 const DIVISIBILITY: u8 = 18;
 const MAX_LOCKS: usize = 8;
@@ -39,6 +39,12 @@ const MAX_LOCK_EPOCHS: u64 = 530_000;
 fn lockbox_template() -> TemplateAddress {
     let hex = option_env!("LOCKBOX_TEMPLATE").expect("built without LOCKBOX_TEMPLATE");
     TemplateAddress::from_hex(hex).expect("LOCKBOX_TEMPLATE is not 64 hex characters")
+}
+
+/// The flat fee per launch, in atomic TARI (6 decimals): 2,500 TARI = 2500000000 on mainnet.
+fn launch_fee() -> Amount {
+    let text = option_env!("LAUNCH_FEE_MICROTARI").expect("built without LAUNCH_FEE_MICROTARI");
+    Amount::new(text.parse().expect("LAUNCH_FEE_MICROTARI is not a whole number"))
 }
 
 fn fee_account() -> ComponentAddress {
@@ -151,11 +157,12 @@ mod launch_commitments {
     }
 }
 
-/// Accepts exactly `LAUNCH_FEE` of revealed native TARI and deposits it into the fee account.
+/// Accepts exactly the launch fee in revealed native TARI and deposits it into the fee account.
 fn take_fee(fee: Bucket) {
     assert!(fee.resource_address() == TARI_TOKEN, "The fee must be paid in TARI");
     fee.assert_contains_no_confidential_funds();
-    assert!(fee.amount() == LAUNCH_FEE, "The fee is exactly {LAUNCH_FEE} (atomic TARI), got {}", fee.amount());
+    let expected = launch_fee();
+    assert!(fee.amount() == expected, "The fee is exactly {expected} (atomic TARI), got {}", fee.amount());
     ComponentManager::get(fee_account()).invoke("deposit", tari_template_lib::invoke_args![fee]);
 }
 

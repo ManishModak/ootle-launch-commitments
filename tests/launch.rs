@@ -51,6 +51,7 @@ fn setup_with_lockbox(lockbox_path: &str) -> Env {
     let launcher = builder.add_template_opts(".", &[], [
         ("LOCKBOX_TEMPLATE", lockbox.to_string()),
         ("FEE_ACCOUNT", fee_account.to_string()),
+        ("LAUNCH_FEE_MICROTARI", LAUNCH_FEE.to_string()),
     ]);
     let probe = builder.add_template("tests/templates/probe");
     let mut test = TemplateTest::from_package(builder.build());
