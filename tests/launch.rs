@@ -77,24 +77,44 @@ fn key(seed: u8) -> RistrettoPublicKeyBytes {
     RistrettoPublicKey::from_secret_key(&secret).to_byte_type()
 }
 
-/// A launch transaction: withdraw `fee` TARI, launch with `locks`, deposit the remainder.
-fn launch_tx(env: &Env, fee: Amount, locks: Vec<(Amount, u64, RistrettoPublicKeyBytes)>, deposit: bool) -> Transaction {
+/// The launch inputs other than the fee; `Inputs::default()` is a valid launch.
+#[derive(Clone)]
+struct Inputs {
+    symbol: String,
+    name: String,
+    image_url: String,
+    supply: Amount,
+    locks: Vec<(Amount, u64, RistrettoPublicKeyBytes)>,
+}
+
+impl Default for Inputs {
+    fn default() -> Self {
+        Inputs {
+            symbol: "TEST".into(),
+            name: "Test Token".into(),
+            image_url: "https://example.com/test.png".into(),
+            supply: Amount::new(SUPPLY),
+            locks: two_locks(),
+        }
+    }
+}
+
+/// A launch transaction: withdraw `fee` TARI, launch, and (if `deposit`) deposit the remainder.
+fn launch_tx_with(env: &Env, fee: Amount, inputs: Inputs, deposit: bool) -> Transaction {
+    let Inputs { symbol, name, image_url, supply, locks } = inputs;
     let tx = env
         .test
         .transaction()
         .call_method(env.creator.0, "withdraw", args![TARI_TOKEN, fee])
         .put_last_instruction_output_on_workspace("fee")
-        .call_function(env.launcher, "launch", args![
-            Workspace("fee"),
-            "TEST",
-            "Test Token",
-            "https://example.com/test.png",
-            Amount::new(SUPPLY),
-            locks
-        ])
+        .call_function(env.launcher, "launch", args![Workspace("fee"), symbol, name, image_url, supply, locks])
         .put_last_instruction_output_on_workspace("rest");
     let tx = if deposit { tx.call_method(env.creator.0, "deposit", args![Workspace("rest")]) } else { tx };
     tx.build_and_seal(&env.creator.2)
+}
+
+fn launch_tx(env: &Env, fee: Amount, locks: Vec<(Amount, u64, RistrettoPublicKeyBytes)>, deposit: bool) -> Transaction {
+    launch_tx_with(env, fee, Inputs { locks, ..Inputs::default() }, deposit)
 }
 
 fn two_locks() -> Vec<(Amount, u64, RistrettoPublicKeyBytes)> {
@@ -293,4 +313,50 @@ fn nobody_can_change_a_launched_token_but_its_owned_twin_can_be() {
     })
     .unwrap();
     assert_eq!(balance(&mut env, other.0, token), Amount::new(5));
+}
+
+#[test]
+fn launch_rejects_bad_inputs() {
+    let mut env = setup();
+    let lock = |amount: u128, epoch: u64| (Amount::new(amount), epoch, key(1));
+    let cases: Vec<(Inputs, &str)> = vec![
+        (Inputs { locks: vec![], ..Default::default() }, "Give 1-8 locks"),
+        (Inputs { locks: vec![lock(1, 100); 9], ..Default::default() }, "Give 1-8 locks"),
+        (Inputs { locks: vec![lock(SUPPLY, 100), lock(1, 100)], ..Default::default() }, "more than the supply"),
+        (Inputs { locks: vec![lock(0, 100)], ..Default::default() }, "positive amount"),
+        (Inputs { locks: vec![lock(1, NOW + 530_001)], ..Default::default() }, "epochs away"),
+        (Inputs { supply: Amount::zero(), ..Default::default() }, "Supply must be positive"),
+        (Inputs { symbol: "".into(), ..Default::default() }, "Symbol must be"),
+        (Inputs { symbol: "S".repeat(13), ..Default::default() }, "Symbol must be"),
+        (Inputs { name: "N".repeat(65), ..Default::default() }, "Name must be"),
+        (Inputs { image_url: format!("https://{}", "u".repeat(250)), ..Default::default() }, "Image URL is longer"),
+        (Inputs { image_url: "http://example.com/x.png".into(), ..Default::default() }, "must start with https://"),
+        (Inputs { image_url: "javascript:alert(1)".into(), ..Default::default() }, "must start with https://"),
+    ];
+    for (inputs, expected) in cases {
+        let reason = env.test.execute_expect_failure(launch_tx_with(&env, LAUNCH_FEE, inputs, true), vec![env.creator.1.clone()]);
+        assert!(format!("{reason:?}").contains(expected), "expected {expected:?}, got {reason:?}");
+    }
+
+    // Eight locks summing exactly to the supply is the largest valid launch; nothing remains.
+    let eight = vec![(Amount::new(SUPPLY / 8), 100, key(1)); 8];
+    env.test.execute_expect_success(launch_tx_with(&env, LAUNCH_FEE, Inputs { locks: eight, ..Default::default() }, true), vec![env.creator.1.clone()]);
+}
+
+#[test]
+fn the_fee_must_be_tari() {
+    let mut env = setup();
+    // The owned twin stands in for any token that isn't TARI.
+    let (_, holder) = owned_twin(&mut env);
+    let tx = env
+        .test
+        .transaction()
+        .call_method(holder, "take", args![LAUNCH_FEE])
+        .put_last_instruction_output_on_workspace("fee")
+        .call_function(env.launcher, "launch", args![Workspace("fee"), "TEST", "Test Token", "", Amount::new(SUPPLY), two_locks()])
+        .put_last_instruction_output_on_workspace("rest")
+        .call_method(env.creator.0, "deposit", args![Workspace("rest")])
+        .build_and_seal(&env.creator.2);
+    let reason = env.test.execute_expect_failure(tx, vec![env.creator.1.clone()]);
+    assert!(format!("{reason:?}").contains("must be paid in TARI"), "{reason:?}");
 }
