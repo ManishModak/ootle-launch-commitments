@@ -1545,6 +1545,7 @@ checksum = "47d9d19d1d6efa0109d2f65ff4c85cddd50bd572e5a00127ab10987290bcefae"
 [[package]]
 name = "lockbox-cli"
 version = "0.1.0"
+source = "git+https://github.com/ManishModak/ootle-lockbox?rev=c938278dacb1c5fb4f6a44d34421eb3243ddcd1f#c938278dacb1c5fb4f6a44d34421eb3243ddcd1f"
 dependencies = [
  "anyhow",
  "ootle-rs",

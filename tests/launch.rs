@@ -36,11 +36,19 @@ struct Env {
 /// from a fixed key (so the build is cached across runs), and creates the fee account and a
 /// creator holding enough TARI for the fee.
 fn setup() -> Env {
-    setup_with_lockbox("../ootle-lockbox")
+    setup_with("../ootle-lockbox", FeeAccount::Created)
 }
 
-/// `setup`, with Launch Commitments pinned to the Lockbox-compatible template at `lockbox_path`.
-fn setup_with_lockbox(lockbox_path: &str) -> Env {
+/// Whether `setup_with` creates the account the template's fees go to.
+enum FeeAccount {
+    Created,
+    /// The template is pinned to the usual fee account address, but no component exists there.
+    Missing,
+}
+
+/// `setup`, with Launch Commitments pinned to the Lockbox-compatible template at `lockbox_path`,
+/// and the fee account created or left missing.
+fn setup_with(lockbox_path: &str, fee_account_state: FeeAccount) -> Env {
     let fee_key = secret(200);
     let fee_public: RistrettoPublicKeyBytes = RistrettoPublicKey::from_secret_key(&fee_key).to_byte_type();
     let fee_account = derive_component_address_from_public_key(&TemplateAddress::from_array([0; 32]), &fee_public);
@@ -58,8 +66,10 @@ fn setup_with_lockbox(lockbox_path: &str) -> Env {
     test.bootstrap_state();
     test.set_virtual_substate(VirtualSubstateId::CurrentEpoch, VirtualSubstate::CurrentEpoch(NOW));
 
-    let created = test.create_account(fee_public, None, vec![NonFungibleAddress::from_public_key(fee_public)]);
-    assert_eq!(created, fee_account, "the fee account must sit at the address the template was built with");
+    if let FeeAccount::Created = fee_account_state {
+        let created = test.create_account(fee_public, None, vec![NonFungibleAddress::from_public_key(fee_public)]);
+        assert_eq!(created, fee_account, "the fee account must sit at the address the template was built with");
+    }
 
     let creator = test.create_funded_account();
     // A funded account starts with 1,000 TARI and the faucet pays once per account, but the fee
@@ -225,7 +235,7 @@ fn a_failure_after_the_fee_undoes_everything() {
 
 #[test]
 fn a_failure_inside_the_second_nested_lock_undoes_everything() {
-    let mut env = setup_with_lockbox("tests/templates/failing_lockbox");
+    let mut env = setup_with("tests/templates/failing_lockbox", FeeAccount::Created);
     let (fee_account, creator) = (env.fee_account, env.creator.0);
     let fee_before = balance(&mut env, fee_account, TARI_TOKEN);
     let creator_before = balance(&mut env, creator, TARI_TOKEN);
@@ -239,6 +249,33 @@ fn a_failure_inside_the_second_nested_lock_undoes_everything() {
 
     // The same template launches normally when no lock fails, so the failure above was the cause.
     env.test.execute_expect_success(launch_tx(&env, LAUNCH_FEE, two_locks(), true), vec![env.creator.1.clone()]);
+}
+
+#[test]
+fn a_missing_fee_account_fails_the_launch_and_keeps_nothing() {
+    let mut env = setup_with("../ootle-lockbox", FeeAccount::Missing);
+    let creator = env.creator.0;
+    let creator_before = balance(&mut env, creator, TARI_TOKEN);
+
+    let tx = launch_tx(&env, LAUNCH_FEE, two_locks(), true);
+    let proofs = vec![env.creator.1.clone()];
+    let result = env.test.execute_and_commit_on_success(tx, proofs);
+    let reason = result.finalize.result.any_reject().expect("the launch should have been rejected").to_string();
+    // The fee phase (empty here) is all that may be kept: nothing but the transaction's receipt.
+    if let Some(kept) = result.finalize.result.any_accept() {
+        assert!(
+            kept.down_len() == 0 && kept.up_iter().all(|(id, _)| id.is_transaction_receipt()),
+            "only the receipt may be kept: {kept:?}"
+        );
+    }
+    // The fee deposit is what failed: the fee account isn't there to take it.
+    assert!(reason.contains(&env.fee_account.to_string()), "the rejection should name the missing fee account: {reason}");
+
+    assert_eq!(balance(&mut env, creator, TARI_TOKEN), creator_before, "the creator keeps their TARI");
+    let store = env.test.read_only_state_store();
+    let records = store.get_components_by_template_address(env.launcher).unwrap();
+    let locks = store.get_components_by_template_address(env.lockbox).unwrap();
+    assert!(records.is_empty() && locks.is_empty(), "no launch record or lock may survive");
 }
 
 #[test]
